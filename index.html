@@ -632,29 +632,43 @@ function scanFound(code,how){
   return true}
 function onDecoded(text,how){const now=Date.now();const t=String(text||"").replace(/\D/g,"");if(!t)return;if(t===SCAN.last&&now-SCAN.lastT<2500)return;SCAN.last=t;SCAN.lastT=now;if(navigator.vibrate)try{navigator.vibrate(40)}catch(e){};scanFound(t,how)}
 function loadZX(){return new Promise((ok,bad)=>{if(window.ZXing)return ok();const sc=document.createElement("script");sc.src="zxing.min.js";sc.onload=()=>ok();sc.onerror=()=>bad(new Error("zxing"));document.head.appendChild(sc)})}
+/* Свой цикл захвата: берём кадр видео, вырезаем область рамки (как на экране, с учётом object-fit:cover), увеличиваем и декодируем.
+   Нативный BarcodeDetector (Android Chrome) или ZXing core (iPhone Safari). Встроенный цикл ZXing на iOS работал ненадёжно (10.10). */
+let ZXR=null,BD=null;
+function zxReader(){if(ZXR)return ZXR;const h=new Map();h.set(ZXing.DecodeHintType.POSSIBLE_FORMATS,[ZXing.BarcodeFormat.EAN_13,ZXing.BarcodeFormat.EAN_8,ZXing.BarcodeFormat.UPC_A,ZXing.BarcodeFormat.CODE_128]);h.set(ZXing.DecodeHintType.TRY_HARDER,true);ZXR=new ZXing.MultiFormatReader();ZXR.setHints(h);return ZXR}
+function zxDecode(canvas){try{const src=new ZXing.HTMLCanvasElementLuminanceSource(canvas);const bmp=new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(src));return zxReader().decodeWithState(bmp).getText()}catch(e){return null}}
+async function bdDecode(canvas){try{const r=await BD.detect(canvas);return r&&r.length?r[0].rawValue:null}catch(e){return null}}
+const SCV=document.createElement("canvas");
+function grab(v,crop){ /* crop: доля кадра по центру (1 = весь кадр) */
+  const vw=v.videoWidth,vh=v.videoHeight;if(!vw||!vh)return null;
+  const box=$("scan").querySelector(".scan-frame").getBoundingClientRect(),cam=$("scan").querySelector(".scan-cam").getBoundingClientRect();
+  const sc=Math.max(cam.width/vw,cam.height/vh);           /* object-fit:cover */
+  const visW=cam.width/sc,visH=cam.height/sc,ox=(vw-visW)/2,oy=(vh-visH)/2;
+  let sx,sy,sw,sh;
+  if(crop<1){sx=ox+(box.left-cam.left)/sc;sy=oy+(box.top-cam.top)/sc;sw=box.width/sc;sh=box.height/sc;const px=sw*.12,py=sh*.35;sx-=px;sy-=py;sw+=2*px;sh+=2*py}
+  else{sx=ox;sy=oy;sw=visW;sh=visH}
+  sx=Math.max(0,sx);sy=Math.max(0,sy);sw=Math.min(vw-sx,sw);sh=Math.min(vh-sy,sh);
+  const W=crop<1?Math.max(900,Math.min(1600,Math.round(sw*2))):Math.round(sw),H=Math.round(sh*W/sw);
+  SCV.width=W;SCV.height=H;const c=SCV.getContext("2d",{willReadFrequently:true});c.imageSmoothingEnabled=true;c.drawImage(v,sx,sy,sw,sh,0,0,W,H);return SCV}
 async function startCam(){
   const v=$("scanv");
   if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){scanMsg("Камера в этом браузере недоступна — введите код с ценника вручную.",true);return}
-  const cons={video:{facingMode:{ideal:"environment"},width:{ideal:1280},height:{ideal:720}},audio:false};
-  let native=false;try{native=("BarcodeDetector" in window)&&(await BarcodeDetector.getSupportedFormats()).indexOf("ean_13")>=0}catch(e){native=false}
   try{
-    if(native){
-      SCAN.stream=await navigator.mediaDevices.getUserMedia(cons);v.srcObject=SCAN.stream;await v.play().catch(()=>{});
-      const det=new BarcodeDetector({formats:["ean_13","ean_8","upc_a","code_128"]});
-      const tick=async()=>{if(!SCAN.on)return;try{if(v.readyState>=2){const r=await det.detect(v);if(r&&r.length)onDecoded(r[0].rawValue,"native")}}catch(e){}SCAN.timer=setTimeout(tick,180)};tick();
-      scanMsg("Камера включена. Держите ценник в рамке.");
-    }else{
-      await loadZX();
-      const hints=new Map();hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS,[ZXing.BarcodeFormat.EAN_13,ZXing.BarcodeFormat.EAN_8,ZXing.BarcodeFormat.UPC_A,ZXing.BarcodeFormat.CODE_128]);hints.set(ZXing.DecodeHintType.TRY_HARDER,true);
-      SCAN.reader=new ZXing.BrowserMultiFormatReader(hints,300);
-      await SCAN.reader.decodeFromConstraints(cons,v,(res,err)=>{if(res)onDecoded(res.getText(),"zxing")});
-      scanMsg("Камера включена. Держите ценник в рамке.");
-    }
+    let native=false;try{native=("BarcodeDetector" in window)&&(await BarcodeDetector.getSupportedFormats()).indexOf("ean_13")>=0}catch(e){native=false}
+    if(native)BD=new BarcodeDetector({formats:["ean_13","ean_8","upc_a","code_128"]});else await loadZX();
+    const cons={video:{facingMode:{ideal:"environment"},width:{ideal:1920},height:{ideal:1080}},audio:false};
+    SCAN.stream=await navigator.mediaDevices.getUserMedia(cons);v.srcObject=SCAN.stream;
+    try{const tr=SCAN.stream.getVideoTracks()[0];const cap=tr.getCapabilities?tr.getCapabilities():{};if(cap.focusMode&&cap.focusMode.indexOf("continuous")>=0)await tr.applyConstraints({advanced:[{focusMode:"continuous"}]})}catch(e){}
+    await v.play().catch(()=>{});
+    let n=0,busy=false;
+    const tick=async()=>{if(!SCAN.on)return;
+      if(!busy&&v.readyState>=2&&v.videoWidth){busy=true;try{const cv=grab(v,(n++%3===2)?1:0.5);if(cv){const t=BD?await bdDecode(cv):zxDecode(cv);if(t)onDecoded(t,BD?"native":"zxing")}}catch(e){}busy=false}
+      SCAN.timer=setTimeout(tick,BD?150:120)};
+    tick();scanMsg("Камера включена. Поднесите штрихкод ценника в рамку, 10–15 см от камеры.");
   }catch(e){scanMsg("Нет доступа к камере ("+(e&&e.name||"ошибка")+"). Разрешите камеру в настройках браузера или введите код вручную.",true)}
 }
 function openScan(){if(SCAN.on)return;SCAN.on=true;const d=$("scan");d.hidden=false;lock(true);scanMsg("Включаю камеру…");$("scani").value="";track("scan_open");startCam()}
 function closeScan(keepLock){if(!SCAN.on)return;SCAN.on=false;clearTimeout(SCAN.timer);
-  try{if(SCAN.reader){SCAN.reader.reset();SCAN.reader=null}}catch(e){}
   try{if(SCAN.stream){SCAN.stream.getTracks().forEach(t=>t.stop());SCAN.stream=null}}catch(e){}
   const v=$("scanv");try{v.pause();v.srcObject=null}catch(e){}
   $("scan").hidden=true;if(!keepLock&&PI<0&&!$("drawer").classList.contains("on"))lock(false)}
